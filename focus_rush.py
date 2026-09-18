@@ -181,6 +181,39 @@ def fetch_achievement_csv(url, timeout=10):
 
 
 
+
+def migrate_tasks(data):
+    """旧形式(total/done)のQUESTを新しいページ番号形式へ移行する。"""
+    for task in data.get("tasks", []):
+        if "start_page" in task and "end_page" in task and "current_page" in task:
+            try:
+                task["start_page"] = int(task["start_page"])
+                task["end_page"] = int(task["end_page"])
+                task["current_page"] = int(task["current_page"])
+            except (TypeError, ValueError):
+                task["start_page"] = 1
+                task["end_page"] = max(1, int(task.get("total", 1)))
+                task["current_page"] = min(
+                    task["end_page"],
+                    task["start_page"] + max(0, int(task.get("done", 0)))
+                )
+        else:
+            # 旧形式:
+            # total=16, done=14 -> 1〜16, 現在14
+            total = max(1, int(task.get("total", 1)))
+            done = min(total, max(0, int(task.get("done", 0))))
+            task["start_page"] = 1
+            task["end_page"] = total
+            task["current_page"] = done if done > 0 else 1
+        if task["end_page"] < task["start_page"]:
+            task["start_page"], task["end_page"] = task["end_page"], task["start_page"]
+        task["current_page"] = max(
+            task["start_page"],
+            min(task["end_page"], task["current_page"])
+        )
+    return data
+
+
 def load_data():
     if not DATA_FILE.exists():
         return json.loads(json.dumps(DEFAULT_DATA))
@@ -271,6 +304,40 @@ def ensure_level(data):
         data["level"] += 1
 
 
+
+def task_first_page(task):
+    return int(task.get("start_page", 1))
+
+
+def task_last_page(task):
+    return int(task.get("end_page", task.get("total", 1)))
+
+
+def task_next_page(task):
+    start = task_first_page(task)
+    current = int(task.get("current_page", start))
+    if not task.get("started", False):
+        return start
+    return current + 1
+
+
+def task_next_range(task, max_pages=3):
+    start = task_next_page(task)
+    end = task_last_page(task)
+    if start > end:
+        return None
+    return start, min(end, start + max_pages - 1)
+
+
+def task_remaining_pages(task):
+    start = task_first_page(task)
+    end = task_last_page(task)
+    current = int(task.get("current_page", start))
+    if not task.get("started", False):
+        return end - start + 1
+    return max(0, end - current)
+
+
 def current_level_progress(data):
     level = data["level"]
     start = total_xp_for_level(level)
@@ -280,9 +347,19 @@ def current_level_progress(data):
 
 
 def task_progress(task):
-    total = max(1, int(task["total"]))
-    done = min(total, max(0, int(task["done"])))
-    return done, total, done / total
+    start = int(task.get("start_page", 1))
+    end = int(task.get("end_page", task.get("total", 1)))
+    current = int(task.get("current_page", start))
+    if end < start:
+        start, end = end, start
+    current = max(start, min(end, current))
+    total = end - start + 1
+    done = current - start
+    # 「現在ページ」が開始ページを意味するため、
+    # まだ開始していない場合は0ページCLEAR、開始ページを終えたら1ページCLEAR。
+    if task.get("current_page", start) == start and task.get("started", False) is not True:
+        done = 0
+    return done, total, max(0, min(1, done / max(1, total)))
 
 
 def add_seconds_to_today(data, seconds):
@@ -317,6 +394,7 @@ class FocusRushApp(tk.Tk):
         self.minsize(900, 680)
 
         self.data = load_data()
+        migrate_tasks(self.data)
         initialize_achievements(self.data)
         settle_running_stopwatch(self.data)
         self.focus_running = False
@@ -425,6 +503,8 @@ class FocusRushApp(tk.Tk):
         top.pack(fill="x", pady=(0, 10))
         self.home_message = ttk.Label(top, style="Header.TLabel")
         self.home_message.pack(side="left")
+        self.manage_task_btn = ttk.Button(top, text="QUEST管理", command=self.manage_tasks_dialog)
+        self.manage_task_btn.pack(side="right", padx=(0, 6))
         self.add_task_btn = ttk.Button(top, text="+ QUEST追加", command=self.add_task_dialog)
         self.add_task_btn.pack(side="right")
 
@@ -491,9 +571,16 @@ class FocusRushApp(tk.Tk):
         today = date.today()
 
         def key(t):
-            done = int(t.get("done", 0))
-            total = max(1, int(t.get("total", 1)))
-            remain = total - done
+            remain = task_remaining_pages(t)
+            start_page = task_first_page(t)
+            end_page = task_last_page(t)
+            total = max(1, end_page - start_page + 1)
+            if t.get("started", False):
+                current_page = int(t.get("current_page", start_page))
+                done = max(0, min(total, current_page - start_page))
+            else:
+                done = 0
+
             due_raw = t.get("due")
             if due_raw:
                 try:
@@ -531,6 +618,9 @@ class FocusRushApp(tk.Tk):
         task = self.recommended_task()
         if task:
             done, total, frac = task_progress(task)
+            first_page = task_first_page(task)
+            last_page = task_last_page(task)
+            current_page = int(task.get("current_page", first_page))
             ttk.Label(self.quest_container, text=task["name"], style="Big.TLabel").pack(anchor="w")
             meta = []
             if task.get("subject"):
@@ -546,16 +636,33 @@ class FocusRushApp(tk.Tk):
                 text=self.render_progress(self.quest_container, done, total),
                 style="Mono.TLabel"
             ).pack(anchor="w", pady=(5, 0))
+            if task.get("started", False):
+                status_text = f"{first_page}〜{last_page}  /  現在 {current_page}ページ"
+            else:
+                status_text = f"{first_page}〜{last_page}ページ"
             ttk.Label(
-                self.quest_container, text=f"{done} / {total}",
+                self.quest_container, text=status_text,
                 style="Panel.TLabel"
             ).pack(anchor="w")
-            remain = total - done
-            unit = task.get("unit", "ページ")
+
+            remain = task_remaining_pages(task)
+            next_range = task_next_range(task, 3)
+            if next_range:
+                nr_start, nr_end = next_range
+                if nr_start == nr_end:
+                    action_text = f"次にやる：{nr_start}ページ"
+                else:
+                    action_text = f"次にやる：{nr_start}〜{nr_end}ページ"
+            else:
+                action_text = "QUEST COMPLETE"
             ttk.Label(
-                self.quest_container, text=f"あと{remain}{unit}",
+                self.quest_container, text=f"あと{remain}ページ",
                 style="Hero.TLabel"
             ).pack(anchor="w", pady=(8, 0))
+            ttk.Label(
+                self.quest_container, text=action_text,
+                style="Big.TLabel"
+            ).pack(anchor="w", pady=(2, 0))
 
             self.focus_button.config(text=f"FOCUS RUN  •  {task['name']}")
             self.focus_button.state(["!disabled"])
@@ -590,13 +697,20 @@ class FocusRushApp(tk.Tk):
         if not self.get_open_tasks():
             return "提出物 ALL CLEAR!"
         task = self.recommended_task()
-        return f"NEXT: {task['name']} / あと{task_progress(task)[1] - task_progress(task)[0]}{task.get('unit', 'ページ')}"
+        remaining = task_remaining_pages(task)
+        next_range = task_next_range(task, 3)
+        if next_range:
+            a, b = next_range
+            page_text = f"{a}ページ" if a == b else f"{a}〜{b}ページ"
+        else:
+            page_text = "完了"
+        return f"NEXT: {task['name']} / 次にやる {page_text} / あと{remaining}ページ"
 
     def estimate_levelup(self):
         tasks = self.get_open_tasks()
         if not tasks:
             return None
-        remain = min(int(t["total"]) - int(t["done"]) for t in tasks)
+        remain = min(task_remaining_pages(t) for t in tasks)
         t = self.recommended_task()
         return max(1, min(remain, 5)), t["name"]
 
@@ -710,68 +824,265 @@ class FocusRushApp(tk.Tk):
 
     # ---------- TASKS ----------
     def add_task_dialog(self):
-        win = tk.Toplevel(self)
-        win.title("QUEST追加")
-        win.geometry("420x380")
-        win.transient(self)
+        self.task_edit_dialog(task=None)
+
+    def task_edit_dialog(self, task=None, parent=None):
+        """新規QUEST追加 / 既存QUEST編集を共通化。"""
+        win = tk.Toplevel(parent or self)
+        win.title("QUEST編集" if task else "QUEST追加")
+        win.geometry("460x420")
+        win.transient(parent or self)
         win.grab_set()
+
+        current_task = task or {}
 
         fields = {}
         specs = [
             ("提出物名", "name"),
-            ("全単位数", "total"),
-            ("現在の進捗", "done"),
+            ("開始ページ", "start_page"),
+            ("終了ページ", "end_page"),
+            ("現在のページ", "current_page"),
             ("期限 (YYYY-MM-DD / 任意)", "due"),
             ("教科 (任意)", "subject"),
-            ("単位名 (ページ/問題/枚)", "unit"),
         ]
-        defaults = {"total": "10", "done": "0", "unit": "ページ"}
+        defaults = {
+            "start_page": str(current_task.get("start_page", 1)),
+            "end_page": str(current_task.get("end_page", 10)),
+            "current_page": (
+                str(current_task.get("current_page", 1))
+                if task and task.get("started", False)
+                else ""
+            ),
+            "due": current_task.get("due", ""),
+            "subject": current_task.get("subject", ""),
+        }
+
         for i, (label, key) in enumerate(specs):
             ttk.Label(win, text=label).grid(row=i, column=0, sticky="w", padx=12, pady=8)
-            e = ttk.Entry(win, width=30)
+            e = ttk.Entry(win, width=32)
             e.grid(row=i, column=1, padx=12, pady=8)
-            if key in defaults:
+            if key == "name":
+                e.insert(0, current_task.get("name", ""))
+            else:
                 e.insert(0, defaults[key])
             fields[key] = e
+
+        # 編集時の補足表示
+        note_text = (
+            "「現在のページ」は、まだ開始していない場合は空欄でも構いません。"
+            if not task else
+            "現在ページを変更すると、次のCLEAR位置も変更されます。"
+        )
+        ttk.Label(
+            win, text=note_text, style="Sub.TLabel",
+            wraplength=420, justify="left"
+        ).grid(row=len(specs), column=0, columnspan=2, sticky="w", padx=12, pady=(4, 12))
 
         def submit():
             name = fields["name"].get().strip()
             try:
-                total = int(fields["total"].get())
-                done = int(fields["done"].get())
+                start_page = int(fields["start_page"].get())
+                end_page = int(fields["end_page"].get())
+                current_text = fields["current_page"].get().strip()
+
+                if current_text:
+                    current_page = int(current_text)
+                    started = True
+                else:
+                    # 未開始なら開始ページより1つ前を保持し、表示だけ「未開始」とする。
+                    current_page = start_page
+                    started = False
             except ValueError:
-                messagebox.showerror("入力エラー", "全単位数と進捗は整数で入力してください。", parent=win)
+                messagebox.showerror("入力エラー", "ページ番号は整数で入力してください。", parent=win)
                 return
-            if not name or total <= 0 or done < 0 or done > total:
-                messagebox.showerror("入力エラー", "提出物名と数値を確認してください。", parent=win)
+
+            if not name:
+                messagebox.showerror("入力エラー", "提出物名を入力してください。", parent=win)
                 return
+            if start_page <= 0 or end_page < start_page:
+                messagebox.showerror("入力エラー", "開始ページと終了ページを確認してください。", parent=win)
+                return
+            if started and not (start_page <= current_page <= end_page):
+                messagebox.showerror(
+                    "入力エラー",
+                    "現在のページは開始ページ〜終了ページの範囲内にしてください。",
+                    parent=win
+                )
+                return
+
             due = fields["due"].get().strip()
             if due:
                 try:
                     date.fromisoformat(due)
                 except ValueError:
-                    messagebox.showerror("入力エラー", "期限はYYYY-MM-DD形式です。", parent=win)
+                    messagebox.showerror(
+                        "入力エラー", "期限はYYYY-MM-DD形式です。", parent=win
+                    )
                     return
 
-            task = {
-                "id": str(int(now_ts() * 1000000)),
-                "name": name,
-                "total": total,
-                "done": done,
-                "due": due,
-                "subject": fields["subject"].get().strip(),
-                "unit": fields["unit"].get().strip() or "ページ",
-                "created": today_str(),
-            }
-            self.data["tasks"].append(task)
+            if task is None:
+                new_task = {
+                    "id": str(int(now_ts() * 1000000)),
+                    "name": name,
+                    "start_page": start_page,
+                    "end_page": end_page,
+                    "current_page": current_page,
+                    "started": started,
+                    "due": due,
+                    "subject": fields["subject"].get().strip(),
+                    "created": today_str(),
+                }
+                self.data["tasks"].append(new_task)
+                target = new_task
+            else:
+                task["name"] = name
+                task["start_page"] = start_page
+                task["end_page"] = end_page
+                task["current_page"] = min(end_page, max(start_page, current_page))
+                task["started"] = started
+                task["due"] = due
+                task["subject"] = fields["subject"].get().strip()
+                target = task
+
             save_data(self.data)
             win.destroy()
             self.refresh_all()
 
-            if done == total:
-                self.complete_task(task)
+            # 編集/追加直後に100%なら自動完了はせず、管理上は完了状態にする。
+            if task is not None and target.get("started") and task_last_page(target) == int(target["current_page"]):
+                self.refresh_all()
 
-        ttk.Button(win, text="QUEST追加", command=submit).grid(row=len(specs), column=0, columnspan=2, pady=14)
+        ttk.Button(
+            win,
+            text="保存" if task else "QUEST追加",
+            command=submit
+        ).grid(row=len(specs) + 1, column=0, columnspan=2, pady=14)
+
+    def manage_tasks_dialog(self):
+        """全QUESTの一覧から編集・削除できる管理画面。"""
+        win = tk.Toplevel(self)
+        win.title("QUEST管理")
+        win.geometry("820x520")
+        win.transient(self)
+
+        ttk.Label(
+            win, text="QUEST管理", style="Section.TLabel"
+        ).pack(anchor="w", padx=12, pady=(12, 4))
+
+        ttk.Label(
+            win,
+            text="未完了・完了済みを含むすべてのQUESTを管理できます。",
+            style="Sub.TLabel"
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12)
+
+        cols = ("name", "range", "current", "remaining", "due", "subject", "status")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
+        headings = {
+            "name": "提出物",
+            "range": "範囲",
+            "current": "現在",
+            "remaining": "残り",
+            "due": "期限",
+            "subject": "教科",
+            "status": "状態",
+        }
+        widths = {
+            "name": 190, "range": 100, "current": 80,
+            "remaining": 80, "due": 105, "subject": 90, "status": 90
+        }
+        for col in cols:
+            tree.heading(col, text=headings[col])
+            tree.column(col, width=widths[col], anchor="w")
+        tree.pack(side="left", fill="both", expand=True)
+
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        sb.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=sb.set)
+
+        def populate():
+            for item in tree.get_children():
+                tree.delete(item)
+            for t in self.data.get("tasks", []):
+                start_page = task_first_page(t)
+                end_page = task_last_page(t)
+                if t.get("started", False):
+                    current = int(t.get("current_page", start_page))
+                    current_text = f"{current}p"
+                else:
+                    current_text = "未開始"
+
+                remaining = task_remaining_pages(t)
+                status = "COMPLETE" if remaining == 0 else "ACTIVE"
+                tree.insert(
+                    "", "end",
+                    iid=str(t["id"]),
+                    values=(
+                        t.get("name", ""),
+                        f"{start_page}〜{end_page}",
+                        current_text,
+                        f"{remaining}p",
+                        t.get("due", ""),
+                        t.get("subject", ""),
+                        status,
+                    )
+                )
+
+        def selected_task():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("QUEST管理", "編集または削除するQUESTを選択してください。", parent=win)
+                return None
+            return self.find_task(selected[0])
+
+        def edit_selected():
+            target = selected_task()
+            if not target:
+                return
+            self.task_edit_dialog(target, parent=win)
+            # child dialog is modal; refresh after it closes.
+            populate()
+
+        def delete_selected():
+            target = selected_task()
+            if not target:
+                return
+
+            confirm = messagebox.askyesno(
+                "QUEST削除",
+                f"「{target['name']}」を削除しますか？\n\nこの操作は元に戻せません。",
+                parent=win
+            )
+            if not confirm:
+                return
+
+            self.data["tasks"] = [
+                t for t in self.data["tasks"] if t.get("id") != target.get("id")
+            ]
+
+            # 削除されたQUESTがFOCUS中なら、安全にFOCUSを終了。
+            if self.focus_running and self.focus_started_task_id == target.get("id"):
+                self.abort_focus()
+
+            save_data(self.data)
+            self.refresh_all()
+            populate()
+
+        def add_new():
+            self.task_edit_dialog(task=None, parent=win)
+            populate()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=12)
+        ttk.Button(btns, text="+ 新規QUEST", command=add_new).pack(side="left")
+        ttk.Button(btns, text="編集", command=edit_selected).pack(side="left", padx=8)
+        ttk.Button(btns, text="削除", command=delete_selected).pack(side="left")
+        ttk.Button(btns, text="閉じる", command=win.destroy).pack(side="right")
+
+        tree.bind("<Double-1>", lambda _event: edit_selected())
+        populate()
 
     def find_task(self, task_id):
         return next((t for t in self.data["tasks"] if t["id"] == task_id), None)
@@ -779,12 +1090,25 @@ class FocusRushApp(tk.Tk):
     def clear_task_unit(self, task, amount=1):
         if not task:
             return
-        before = int(task["done"])
-        total = int(task["total"])
-        task["done"] = min(total, before + max(1, amount))
-        gained = task["done"] - before
-        if gained <= 0:
-            return
+
+        start_page = task_first_page(task)
+        end_page = task_last_page(task)
+        current_page = int(task.get("current_page", start_page))
+        was_started = bool(task.get("started", False))
+
+        pages_to_clear = max(1, int(amount))
+        if not was_started:
+            # 最初のCLEARで開始ページを完了扱いにする。
+            new_current = min(end_page, start_page)
+            gained = 1
+            task["started"] = True
+        else:
+            if current_page >= end_page:
+                return
+            new_current = min(end_page, current_page + pages_to_clear)
+            gained = new_current - current_page
+
+        task["current_page"] = new_current
 
         self.data["combo"] += gained
         self.increment_achievement_counter("clears", gained)
@@ -792,39 +1116,83 @@ class FocusRushApp(tk.Tk):
         self.gain_xp(xp, pet=True)
         self.add_daily_progress("clears", gained)
 
-        task_completed = task["done"] >= total
+        task_completed = task["current_page"] >= end_page
         save_data(self.data)
         self.refresh_all()
 
         if task_completed:
             self.complete_task(task)
         else:
+            next_range = task_next_range(task, 1)
+            next_text = ""
+            if next_range:
+                a, b = next_range
+                next_text = f"\n次にやる：{a}ページ" if a == b else f"\n次にやる：{a}〜{b}ページ"
             messagebox.showinfo(
                 "PAGE CLEAR!",
-                f"{task['name']}\n\n{task['done']} / {total}\n+{xp} XP\nCOMBO x{self.data['combo']}\n\nPAGE CLEAR!"
+                f"{task['name']}\n\n"
+                f"範囲 {start_page}〜{end_page}ページ\n"
+                f"現在 {task['current_page']}ページ\n"
+                f"あと{task_remaining_pages(task)}ページ\n"
+                f"+{xp} XP\n"
+                f"COMBO x{self.data['combo']}\n\n"
+                f"PAGE CLEAR!{next_text}"
             )
 
     def complete_task(self, task):
-        task["done"] = task["total"]
+        task["current_page"] = task_last_page(task)
+        task["started"] = True
+
         self.data["combo"] += 1
         self.increment_achievement_counter("completes", 1)
         self.gain_xp(50, pet=True)
         self.add_daily_progress("completes", 1)
+
         self.award_drop()
         save_data(self.data)
         self.refresh_all()
+
         messagebox.showinfo(
             "BOSS CLEAR",
-            f"BOSS CLEAR\n\n{task['name']}\n{task['total']} / {task['total']}\n100%\n\n+50 XP\nDROP!\n\n次のQUESTを提示します。"
+            f"BOSS CLEAR\\n\\n"
+            f"{task['name']}\\n"
+            f"{task_first_page(task)}〜{task_last_page(task)}ページ\\n"
+            f"100%\\n\\n"
+            f"+50 XP\\n"
+            f"DROP!"
         )
+
+        # FOCUS RUN中なら、完了後も次のQUESTを操作できるように
+        # 現在のFOCUS画面を閉じてホームへ戻す。
+        if self.focus_running:
+            self.focus_running = False
+            try:
+                self.focus_win.destroy()
+            except Exception:
+                pass
+            self.focus_win = None
+            self.focus_button.config(text="FOCUS RUN")
+
         next_task = self.recommended_task()
         if next_task:
+            next_range = task_next_range(next_task, 3)
+            if next_range:
+                a, b = next_range
+                page_text = f"{a}ページ" if a == b else f"{a}〜{b}ページ"
+            else:
+                page_text = "COMPLETE"
+
             messagebox.showinfo(
                 "NEXT QUEST",
-                f"NEXT QUEST\n\n{next_task['name']}\nあと{int(next_task['total']) - int(next_task['done'])}{next_task.get('unit', 'ページ')}"
+                f"NEXT QUEST\\n\\n"
+                f"{next_task['name']}\\n"
+                f"次にやる：{page_text}"
             )
         else:
-            messagebox.showinfo("ALL CLEAR", "提出物 ALL CLEAR!\n今日は完全クリアです。")
+            messagebox.showinfo(
+                "ALL CLEAR",
+                "提出物 ALL CLEAR!\\n今日は完全クリアです。"
+            )
 
     def manual_clear_recommended(self):
         self.clear_task_unit(self.recommended_task())
@@ -873,7 +1241,10 @@ class FocusRushApp(tk.Tk):
 
         btns = ttk.Frame(frame, style="Panel.TFrame")
         btns.pack(fill="x", pady=15)
-        ttk.Button(btns, text="+1 CLEAR", command=self.focus_manual_clear).pack(
+        self.focus_clear_button = ttk.Button(
+            btns, text="+1 CLEAR", command=self.focus_manual_clear, style="Accent.TButton"
+        )
+        self.focus_clear_button.pack(
             side="left", fill="x", expand=True, padx=(0, 5)
         )
         ttk.Button(btns, text="CLOSE / ABORT", command=self.abort_focus).pack(
@@ -883,15 +1254,53 @@ class FocusRushApp(tk.Tk):
         self.update_focus_popup()
 
     def focus_manual_clear(self):
+        """FOCUS RUN中の+1 CLEAR。モーダル表示を挟まず即座に画面を更新する。"""
         task = self.find_task(self.focus_started_task_id)
-        if not task:
+        if not task or not self.focus_running:
             return
-        before_done = int(task["done"])
-        self.clear_task_unit(task, 1)
-        gained = int(task["done"]) - before_done
-        if gained:
-            self.focus_gain += 10
-            self.focus_gain_label.config(text=f"+{self.focus_gain} XP")
+
+        start_page = task_first_page(task)
+        end_page = task_last_page(task)
+        current_page = int(task.get("current_page", start_page))
+        was_started = bool(task.get("started", False))
+
+        # 最初の+1は開始ページをCLEAR扱いにする。
+        if not was_started:
+            task["started"] = True
+            new_current = start_page
+            gained = 1
+        elif current_page < end_page:
+            new_current = current_page + 1
+            gained = 1
+        else:
+            return
+
+        task["current_page"] = new_current
+
+        self.data["combo"] += gained
+        self.increment_achievement_counter("clears", gained)
+        self.gain_xp(10 * gained, pet=True)
+        self.add_daily_progress("clears", gained)
+        self.focus_gain += 10 * gained
+
+        # 最終ページなら、そのままBOSS CLEARへ。
+        completed = new_current >= end_page
+        save_data(self.data)
+
+        if completed:
+            self.complete_task(task)
+            return
+
+        self.refresh_home()
+        self.refresh_header_only()
+        self.update_focus_popup()
+        self.focus_status_label.config(
+            text=f"PAGE CLEAR!  →  次は {task_next_range(task, 1)[0]}ページ"
+            if task_next_range(task, 1)
+            else "PAGE CLEAR!"
+        )
+        self.focus_gain_label.config(text=f"Session +{self.focus_gain} XP")
+        save_data(self.data)
 
     def update_focus_popup(self):
         if not self.focus_running:
@@ -903,7 +1312,20 @@ class FocusRushApp(tk.Tk):
 
         done, total, frac = task_progress(task)
         self.focus_task_label.config(text=task["name"])
-        self.focus_progress_label.config(text=f"{done} / {total}   •   あと{total-done}{task.get('unit', 'ページ')}")
+        next_range = task_next_range(task, 3)
+        if next_range:
+            a, b = next_range
+            next_text = f"{a}ページ" if a == b else f"{a}〜{b}ページ"
+        else:
+            next_text = "COMPLETE"
+        current_display = int(task.get("current_page", task_first_page(task)))
+        if not task.get("started", False):
+            current_display = task_first_page(task) - 1
+        self.focus_progress_label.config(
+            text=f"{task_first_page(task)}〜{task_last_page(task)}ページ   •   "
+                 f"現在 {current_display}ページ   •   "
+                 f"あと{task_remaining_pages(task)}ページ   •   次にやる {next_text}"
+        )
         self.focus_bar["value"] = frac * 100
         mins, secs = divmod(max(0, int(self.focus_remaining)), 60)
         self.focus_timer_label.config(text=f"{mins:02d}:{secs:02d}")
