@@ -211,6 +211,8 @@ def migrate_tasks(data):
             task["start_page"],
             min(task["end_page"], task["current_page"])
         )
+        task.setdefault("skipped", False)
+        task.setdefault("skipped_at", None)
     return data
 
 
@@ -528,8 +530,10 @@ class FocusRushApp(tk.Tk):
                                        command=self.start_focus_from_recommended)
         self.focus_button.pack(side="left", fill="x", expand=True, padx=(0, 5))
         ttk.Button(q_buttons, text="+1 CLEAR", command=self.manual_clear_recommended).pack(
-            side="left", fill="x", expand=True, padx=(5, 0)
+            side="left", fill="x", expand=True, padx=5
         )
+        self.skip_button = ttk.Button(q_buttons, text="⏭ 飛ばす", command=self.skip_recommended)
+        self.skip_button.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
         self.next_panel = self.make_panel(right, "NEXT REWARD")
         self.next_panel.pack(fill="x", pady=(0, 7))
@@ -558,9 +562,12 @@ class FocusRushApp(tk.Tk):
         self.pet_message_label.pack(anchor="w")
 
     def get_open_tasks(self):
+        """未完了かつスキップされていないQUESTだけを候補にする。"""
         tasks = []
         for t in self.data["tasks"]:
-            if int(t.get("done", 0)) < int(t.get("total", 1)):
+            if t.get("skipped", False):
+                continue
+            if task_remaining_pages(t) > 0:
                 tasks.append(t)
         return tasks
 
@@ -666,16 +673,31 @@ class FocusRushApp(tk.Tk):
 
             self.focus_button.config(text=f"FOCUS RUN  •  {task['name']}")
             self.focus_button.state(["!disabled"])
+            self.skip_button.config(text="⏭ 飛ばす")
+            self.skip_button.state(["!disabled"])
         else:
-            ttk.Label(self.quest_container, text="提出物 ALL CLEAR", style="Hero.TLabel").pack(anchor="center", pady=25)
-            ttk.Label(
-                self.quest_container,
-                text="未完了QUESTはありません。\n今日は完了を維持しましょう。",
-                style="Panel.TLabel",
-                justify="center"
-            ).pack(anchor="center")
+            skipped_tasks = [t for t in self.data.get("tasks", []) if t.get("skipped", False) and task_remaining_pages(t) > 0]
+            if skipped_tasks:
+                ttk.Label(
+                    self.quest_container, text="ALL AVAILABLE QUESTS CLEAR", style="Hero.TLabel"
+                ).pack(anchor="center", pady=(20, 8))
+                ttk.Label(
+                    self.quest_container,
+                    text=f"飛ばしているQUESTが {len(skipped_tasks)} 件あります。\nQUEST管理から再開できます。",
+                    style="Panel.TLabel", justify="center"
+                ).pack(anchor="center")
+            else:
+                ttk.Label(self.quest_container, text="提出物 ALL CLEAR", style="Hero.TLabel").pack(anchor="center", pady=25)
+                ttk.Label(
+                    self.quest_container,
+                    text="未完了QUESTはありません。\n今日は完了を維持しましょう。",
+                    style="Panel.TLabel",
+                    justify="center"
+                ).pack(anchor="center")
             self.focus_button.config(text="FOCUS RUN")
             self.focus_button.state(["disabled"])
+            self.skip_button.config(text="⏭ 飛ばす")
+            self.skip_button.state(["disabled"])
 
         cur, need = current_level_progress(self.data)
         self.xp_summary.config(text=f"LV.{self.data['level']}   {cur} / {need} XP")
@@ -928,6 +950,8 @@ class FocusRushApp(tk.Tk):
                     "end_page": end_page,
                     "current_page": current_page,
                     "started": started,
+                    "skipped": False,
+                    "skipped_at": None,
                     "due": due,
                     "subject": fields["subject"].get().strip(),
                     "created": today_str(),
@@ -1015,7 +1039,12 @@ class FocusRushApp(tk.Tk):
                     current_text = "未開始"
 
                 remaining = task_remaining_pages(t)
-                status = "COMPLETE" if remaining == 0 else "ACTIVE"
+                if remaining == 0:
+                    status = "COMPLETE"
+                elif t.get("skipped", False):
+                    status = "SKIPPED"
+                else:
+                    status = "ACTIVE"
                 tree.insert(
                     "", "end",
                     iid=str(t["id"]),
@@ -1043,6 +1072,23 @@ class FocusRushApp(tk.Tk):
                 return
             self.task_edit_dialog(target, parent=win)
             # child dialog is modal; refresh after it closes.
+            populate()
+
+        def toggle_skip_selected():
+            target = selected_task()
+            if not target:
+                return
+            if task_remaining_pages(target) == 0:
+                messagebox.showinfo("QUEST管理", "完了済みのQUESTは飛ばせません。", parent=win)
+                return
+
+            target["skipped"] = not target.get("skipped", False)
+            target["skipped_at"] = (
+                datetime.now().isoformat(timespec="seconds")
+                if target["skipped"] else None
+            )
+            save_data(self.data)
+            self.refresh_all()
             populate()
 
         def delete_selected():
@@ -1078,6 +1124,7 @@ class FocusRushApp(tk.Tk):
         btns.pack(fill="x", padx=12, pady=12)
         ttk.Button(btns, text="+ 新規QUEST", command=add_new).pack(side="left")
         ttk.Button(btns, text="編集", command=edit_selected).pack(side="left", padx=8)
+        ttk.Button(btns, text="⏭ 飛ばす / 再開", command=toggle_skip_selected).pack(side="left", padx=(0, 8))
         ttk.Button(btns, text="削除", command=delete_selected).pack(side="left")
         ttk.Button(btns, text="閉じる", command=win.destroy).pack(side="right")
 
@@ -1194,6 +1241,44 @@ class FocusRushApp(tk.Tk):
                 "提出物 ALL CLEAR!\\n今日は完全クリアです。"
             )
 
+    def skip_recommended(self):
+        task = self.recommended_task()
+        if not task:
+            return
+        if not messagebox.askyesno(
+            "QUESTを飛ばす",
+            f"「{task['name']}」を一時的に飛ばしますか？\n\n"
+            "削除はされません。\n"
+            "あとからQUEST管理で再開できます。"
+        ):
+            return
+
+        task["skipped"] = True
+        task["skipped_at"] = datetime.now().isoformat(timespec="seconds")
+        save_data(self.data)
+        self.refresh_all()
+
+        next_task = self.recommended_task()
+        if next_task:
+            next_range = task_next_range(next_task, 3)
+            if next_range:
+                a, b = next_range
+                page_text = f"{a}ページ" if a == b else f"{a}〜{b}ページ"
+            else:
+                page_text = "COMPLETE"
+            messagebox.showinfo(
+                "NEXT QUEST",
+                f"⏭ {task['name']} を飛ばしました。\n\n"
+                f"NEXT QUEST\n{next_task['name']}\n次にやる：{page_text}"
+            )
+        else:
+            messagebox.showinfo(
+                "QUEST SKIPPED",
+                f"⏭ {task['name']} を飛ばしました。\n\n"
+                "現在、利用可能なQUESTはありません。\n"
+                "QUEST管理から再開できます。"
+            )
+
     def manual_clear_recommended(self):
         self.clear_task_unit(self.recommended_task())
 
@@ -1246,6 +1331,9 @@ class FocusRushApp(tk.Tk):
         )
         self.focus_clear_button.pack(
             side="left", fill="x", expand=True, padx=(0, 5)
+        )
+        ttk.Button(btns, text="⏭ QUESTを飛ばす", command=self.skip_focus_task).pack(
+            side="left", fill="x", expand=True, padx=5
         )
         ttk.Button(btns, text="CLOSE / ABORT", command=self.abort_focus).pack(
             side="left", fill="x", expand=True, padx=(5, 0)
@@ -1375,6 +1463,49 @@ class FocusRushApp(tk.Tk):
             "SESSION CLEAR!",
             "SESSION CLEAR!\n\n+15 XP\nCOMBO UP\nDROP!\n\n次の5分へ進めます。"
         )
+
+    def skip_focus_task(self):
+        if not self.focus_running:
+            return
+        task = self.find_task(self.focus_started_task_id)
+        if not task:
+            self.abort_focus()
+            return
+
+        if not messagebox.askyesno(
+            "QUESTを飛ばす",
+            f"「{task['name']}」を一時的に飛ばしますか？\n\n"
+            "現在のページ進捗はそのまま残ります。",
+            parent=self.focus_win
+        ):
+            return
+
+        task["skipped"] = True
+        task["skipped_at"] = datetime.now().isoformat(timespec="seconds")
+        save_data(self.data)
+
+        self.focus_running = False
+        try:
+            self.focus_win.destroy()
+        except Exception:
+            pass
+        self.focus_win = None
+        self.focus_button.config(text="FOCUS RUN")
+        self.refresh_all()
+
+        next_task = self.recommended_task()
+        if next_task:
+            next_range = task_next_range(next_task, 3)
+            if next_range:
+                a, b = next_range
+                page_text = f"{a}ページ" if a == b else f"{a}〜{b}ページ"
+            else:
+                page_text = "COMPLETE"
+            messagebox.showinfo(
+                "NEXT QUEST",
+                f"⏭ {task['name']} を飛ばしました。\n\n"
+                f"NEXT QUEST\n{next_task['name']}\n次にやる：{page_text}"
+            )
 
     def abort_focus(self):
         if not self.focus_running:
